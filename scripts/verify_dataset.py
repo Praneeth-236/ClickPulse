@@ -21,6 +21,10 @@ DeduplicationResult = deduplication_module.DeduplicationResult
 ValidatedRecord = deduplication_module.ValidatedRecord
 deduplicate_validated_records = deduplication_module.deduplicate_validated_records
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DAY1_PATH = Path("data/sample/clicks_day1.jsonl")
+DEFAULT_DAY2_PATH = Path("data/sample/clicks_day2.jsonl")
+
 
 APPROVED_BASELINE = {
     "day1": {
@@ -141,10 +145,20 @@ def _format_report(
     }
 
 
+def _resolve_dataset_path(path: Path) -> Path:
+    """Resolve relative input paths from the repository root, independent of cwd."""
+    candidate = path if path.is_absolute() else REPOSITORY_ROOT / path
+    return candidate.resolve()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--day1", required=True, type=Path, help="Path to original Day 1 JSONL")
-    parser.add_argument("--day2", required=True, type=Path, help="Path to original Day 2 JSONL")
+    parser.add_argument(
+        "--day1", type=Path, default=DEFAULT_DAY1_PATH, help="Day 1 JSONL path"
+    )
+    parser.add_argument(
+        "--day2", type=Path, default=DEFAULT_DAY2_PATH, help="Day 2 JSONL path"
+    )
     parser.add_argument(
         "--skip-baseline-comparison",
         action="store_true",
@@ -152,10 +166,17 @@ def main() -> int:
     )
     args = parser.parse_args()
     compare = not args.skip_baseline_comparison
+    day1_path = _resolve_dataset_path(args.day1)
+    day2_path = _resolve_dataset_path(args.day2)
+    print(f"Day 1 input: {day1_path}", file=sys.stderr)
+    print(f"Day 2 input: {day2_path}", file=sys.stderr)
+    for label, path in (("Day 1", day1_path), ("Day 2", day2_path)):
+        if not path.is_file():
+            parser.error(f"{label} dataset file not found: {path}")
 
     reports = {
-        "day1": verify_dataset(args.day1),
-        "day2": verify_dataset(args.day2),
+        "day1": verify_dataset(day1_path),
+        "day2": verify_dataset(day2_path),
     }
     print(
         json.dumps(
