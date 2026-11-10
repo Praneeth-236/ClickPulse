@@ -1,0 +1,20 @@
+﻿# Core application
+python-dotenv>=1.0,<2.0
+pydantic>=2.7,<3.0
+
+# Kafka
+kafka-python>=2.0,<3.0
+
+# Spark
+pyspark>=3.5,<4.0
+
+# Dashboard and analytics
+streamlit>=1.36,<2.0
+pandas>=2.2,<3.0
+pyarrow>=16,<25
+requests>=2.32,<3.0
+
+# Testing and quality
+pytest>=8,<10
+pytest-cov>=5,<8
+ruff>=0.5,<1.0
