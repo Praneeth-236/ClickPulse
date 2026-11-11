@@ -9,7 +9,12 @@ long-running infrastructure services and must not be started/stopped here.
 
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.operators.bash import BashOperator
+
+try:
+    from airflow.providers.standard.operators.bash import BashOperator
+except ImportError:
+    from airflow.operators.bash import BashOperator
+
 from airflow.providers.ssh.operators.ssh import SSHOperator
 
 default_args = {
@@ -20,14 +25,13 @@ default_args = {
     'retry_delay': timedelta(minutes=1),
 }
 
-# Assume standard repo clone path on all VMs: ~/ClickPulse
 REPO_DIR = "~/ClickPulse"
 
 with DAG(
     'clickpulse_pipeline',
     default_args=default_args,
     description='Orchestrates ClickPulse: Producer -> Consumer/HDFS -> Spark/Iceberg -> Druid',
-    schedule_interval=None,  # Triggered manually for Day 1 and Day 2 runs
+    schedule=None,  # Replaces schedule_interval for Airflow 3+
     start_date=datetime(2026, 1, 1),
     catchup=False,
 ) as dag:
@@ -62,8 +66,4 @@ with DAG(
         cmd_timeout=300
     )
 
-    # Execution Order
-    produce_data_vm1 >> consume_data_vm2 >> spark_process_vm3 >> druid_ingest_vm4
-
-    # Define the execution order
     produce_data_vm1 >> consume_data_vm2 >> spark_process_vm3 >> druid_ingest_vm4
