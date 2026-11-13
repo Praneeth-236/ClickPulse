@@ -162,11 +162,22 @@ class SparkUpsertMetrics:
 
 @dataclass(frozen=True)
 class SparkUpsertResult:
+    """Upsert output; callers must call ``release`` when done with operation details.
+
+    ``operation_details`` is persisted before the Iceberg MERGE so it remains a
+    stable audit of the pre-MERGE target state. Its cache is caller-owned and
+    must be released to avoid retaining data across repeated batches.
+    """
+
     current_state: Any
     operation_details: Any
     metrics: SparkUpsertMetrics
     iceberg_snapshot_id: str | None
     iceberg_committed_at: datetime | None
+
+    def release(self, *, blocking: bool = False) -> None:
+        """Unpersist the pre-MERGE operation audit after its final use."""
+        self.operation_details.unpersist(blocking=blocking)
 
 
 def _event_spark_schema():
@@ -414,88 +425,17 @@ def _require_batch_snapshot_marker(summary: Mapping[str, str], batch_id: str) ->
         )
 
 
-def run_upsert(
-    incoming_records: Any,
+def _execute_materialized_upsert(
+    session: Any,
+    source: Any,
+    details: Any,
     *,
-    spark: Any | None = None,
-    unresolved_ties: Any | None = None,
-    batch_id: str | None = None,
+    table_id: str,
+    batch_id: str | None,
 ) -> SparkUpsertResult:
-    """Merge Spark winners into the configured Iceberg current-state table.
-
-    This is the distributed execution path. It never calls ``apply_upsert`` or
-    collects event rows into Python. ``incoming_records`` is the winners
-    DataFrame returned by Spark deduplication. Supplying unresolved tie IDs is
-    supported defensively; those IDs are excluded before any table operation.
-    """
+    """Commit source rows using metrics from the already-materialized decisions."""
     from pyspark.sql import functions as F
 
-    from clickpulse.spark.runtime import create_iceberg_spark_session, runtime_config
-
-    session = spark if spark is not None else create_iceberg_spark_session("clickpulse-upsert")
-    config = runtime_config()
-    _validate_iceberg_session(session, config.catalog)
-    table_id = _table_identifier(config.catalog, config.namespace, config.table)
-    _ensure_iceberg_table(session, table_id)
-
-    winners = incoming_records
-    if hasattr(incoming_records, "winners"):
-        if unresolved_ties is None:
-            unresolved_ties = incoming_records.unresolved_ties
-        winners = incoming_records.winners
-    if unresolved_ties is not None:
-        winners = winners.join(
-            unresolved_ties.select("event_id").dropDuplicates(["event_id"]),
-            on="event_id",
-            how="left_anti",
-        )
-
-    source = _parse_incoming_records(session, winners)
-    duplicate_incoming = (
-        source.groupBy("event_id")
-        .count()
-        .where(F.col("count") > 1)
-        .limit(1)
-        .count()
-    )
-    if duplicate_incoming:
-        raise ValueError("Incoming Spark winners contain duplicate event IDs")
-
-    existing = session.table(table_id)
-    duplicate_existing = (
-        existing.groupBy("event_id")
-        .count()
-        .where(F.col("count") > 1)
-        .limit(1)
-        .count()
-    )
-    if duplicate_existing:
-        raise ValueError("Iceberg curated table already contains duplicate event IDs")
-
-    source_alias = source.alias("s")
-    target_alias = existing.select("event_id", "event_time").alias("t")
-    comparison = source_alias.join(
-        target_alias,
-        F.col("s.event_id") == F.col("t.event_id"),
-        "left",
-    )
-    operation = (
-        F.when(F.col("t.event_id").isNull(), F.lit("INSERT"))
-        .when(F.col("s.event_time") > F.col("t.event_time"), F.lit("UPDATE"))
-        .otherwise(F.lit("DROP"))
-    )
-    details = comparison.select(
-        F.col("s.event_id").alias("event_id"),
-        operation.alias("operation"),
-        F.when(F.col("t.event_id").isNull(), F.lit("event_id absent from current state"))
-        .when(F.col("s.event_time") > F.col("t.event_time"), F.lit("incoming event_time is later"))
-        .when(
-            F.col("s.event_time") == F.col("t.event_time"),
-            F.lit("incoming event_time equals current event_time"),
-        )
-        .otherwise(F.lit("incoming event_time is earlier"))
-        .alias("reason"),
-    )
     counts = details.agg(
         F.sum(F.when(F.col("operation") == "INSERT", 1).otherwise(0)).alias("insert_count"),
         F.sum(F.when(F.col("operation") == "UPDATE", 1).otherwise(0)).alias("update_count"),
@@ -588,8 +528,108 @@ def run_upsert(
         committed_at = latest_snapshot.committed_at.replace(tzinfo=timezone.utc)
     return SparkUpsertResult(
         current_state=current_state,
-        operation_details=details.orderBy("event_id"),
+        operation_details=details,
         metrics=metrics,
         iceberg_snapshot_id=snapshot_id,
         iceberg_committed_at=committed_at,
     )
+
+
+def run_upsert(
+    incoming_records: Any,
+    *,
+    spark: Any | None = None,
+    unresolved_ties: Any | None = None,
+    batch_id: str | None = None,
+) -> SparkUpsertResult:
+    """Merge Spark winners into the configured Iceberg current-state table.
+
+    This is the distributed execution path. It never calls ``apply_upsert`` or
+    collects event rows into Python. ``incoming_records`` is the winners
+    DataFrame returned by Spark deduplication. Supplying unresolved tie IDs is
+    supported defensively; those IDs are excluded before any table operation.
+    """
+    from pyspark.sql import functions as F
+
+    from clickpulse.spark.runtime import create_iceberg_spark_session, runtime_config
+
+    session = spark if spark is not None else create_iceberg_spark_session("clickpulse-upsert")
+    config = runtime_config()
+    _validate_iceberg_session(session, config.catalog)
+    table_id = _table_identifier(config.catalog, config.namespace, config.table)
+    _ensure_iceberg_table(session, table_id)
+
+    winners = incoming_records
+    if hasattr(incoming_records, "winners"):
+        if unresolved_ties is None:
+            unresolved_ties = incoming_records.unresolved_ties
+        winners = incoming_records.winners
+    if unresolved_ties is not None:
+        winners = winners.join(
+            unresolved_ties.select("event_id").dropDuplicates(["event_id"]),
+            on="event_id",
+            how="left_anti",
+        )
+
+    source = _parse_incoming_records(session, winners)
+    duplicate_incoming = (
+        source.groupBy("event_id")
+        .count()
+        .where(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+    if duplicate_incoming:
+        raise ValueError("Incoming Spark winners contain duplicate event IDs")
+
+    existing = session.table(table_id)
+    duplicate_existing = (
+        existing.groupBy("event_id")
+        .count()
+        .where(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+    if duplicate_existing:
+        raise ValueError("Iceberg curated table already contains duplicate event IDs")
+
+    source_alias = source.alias("s")
+    target_alias = existing.select("event_id", "event_time").alias("t")
+    comparison = source_alias.join(
+        target_alias,
+        F.col("s.event_id") == F.col("t.event_id"),
+        "left",
+    )
+    operation = (
+        F.when(F.col("t.event_id").isNull(), F.lit("INSERT"))
+        .when(F.col("s.event_time") > F.col("t.event_time"), F.lit("UPDATE"))
+        .otherwise(F.lit("DROP"))
+    )
+    from pyspark import StorageLevel
+
+    details = comparison.select(
+        F.col("s.event_id").alias("event_id"),
+        operation.alias("operation"),
+        F.when(F.col("t.event_id").isNull(), F.lit("event_id absent from current state"))
+        .when(F.col("s.event_time") > F.col("t.event_time"), F.lit("incoming event_time is later"))
+        .when(
+            F.col("s.event_time") == F.col("t.event_time"),
+            F.lit("incoming event_time equals current event_time"),
+        )
+        .otherwise(F.lit("incoming event_time is earlier"))
+        .alias("reason"),
+    ).orderBy("event_id").persist(StorageLevel.MEMORY_AND_DISK)
+    try:
+        # Force the join against the pre-MERGE Iceberg snapshot now. Metrics and
+        # the returned audit both consume this same persisted classification.
+        details.count()
+        return _execute_materialized_upsert(
+            session,
+            source,
+            details,
+            table_id=table_id,
+            batch_id=batch_id,
+        )
+    except BaseException:
+        details.unpersist(blocking=True)
+        raise

@@ -28,19 +28,23 @@ def main() -> int:
     try:
         for input_path in args.input_path:
             result = process_batch(input_path, spark=spark)
-            output = {
-                "input_path": input_path,
-                "batch_id": result.batch_id,
-                "replayed": result.replayed,
-            }
-            if result.validation is not None:
-                output["validation"] = result.validation.metrics.__dict__
-            if result.deduplication is not None:
-                output["deduplication"] = result.deduplication.metrics.__dict__
-            if result.upsert is not None:
-                output["upsert"] = result.upsert.metrics.__dict__
-                output["iceberg_snapshot_id"] = result.upsert.iceberg_snapshot_id
-            print(json.dumps(output, sort_keys=True))
+            try:
+                output = {
+                    "input_path": input_path,
+                    "batch_id": result.batch_id,
+                    "replayed": result.replayed,
+                }
+                if result.validation is not None:
+                    output["validation"] = result.validation.metrics.__dict__
+                if result.deduplication is not None:
+                    output["deduplication"] = result.deduplication.metrics.__dict__
+                if result.upsert is not None:
+                    output["upsert"] = result.upsert.metrics.__dict__
+                    output["iceberg_snapshot_id"] = result.upsert.iceberg_snapshot_id
+                print(json.dumps(output, sort_keys=True))
+            finally:
+                if result.upsert is not None:
+                    result.upsert.release()
     finally:
         spark.stop()
     return 0

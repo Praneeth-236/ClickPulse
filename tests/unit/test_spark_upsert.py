@@ -2,6 +2,8 @@
 
 from clickpulse.spark.pipeline import _source_identity
 from clickpulse.spark.upsert_curated import (
+    SparkUpsertMetrics,
+    SparkUpsertResult,
     _execute_sql_with_snapshot_properties,
     _price_fits_decimal_38_18,
     _require_batch_snapshot_marker,
@@ -70,3 +72,20 @@ def test_missing_java11_nashorn_fails_before_running_sql():
         )
 
     spark._jsparkSession.sql.assert_not_called()
+
+
+def test_spark_upsert_result_release_unpersists_operation_details():
+    from unittest.mock import MagicMock
+
+    details = MagicMock()
+    result = SparkUpsertResult(
+        current_state=MagicMock(),
+        operation_details=details,
+        metrics=SparkUpsertMetrics(insert_count=1, update_count=2, drop_count=3),
+        iceberg_snapshot_id=None,
+        iceberg_committed_at=None,
+    )
+
+    result.release(blocking=True)
+
+    details.unpersist.assert_called_once_with(blocking=True)

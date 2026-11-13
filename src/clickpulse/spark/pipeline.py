@@ -36,6 +36,8 @@ from clickpulse.storage.iceberg_batch_ledger import (
 
 @dataclass(frozen=True)
 class BatchPipelineResult:
+    """Pipeline outcome; release ``upsert`` after consuming its operation audit."""
+
     batch_id: str
     replayed: bool
     validation: SparkValidationResult | None
@@ -383,6 +385,8 @@ def process_batch(
     except Exception as exc:
         # Preserve RUNNING for the explicit post-commit crash hook so startup
         # recovery can reconcile it from the Iceberg snapshot marker.
+        if upsert is not None:
+            upsert.release()
         if not commit_returned:
             _record_failure(ledger, record, exc)
         raise

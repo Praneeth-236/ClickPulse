@@ -110,6 +110,11 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
         assert target.select("event_id").distinct().count() == 217
 
         operation_details = day2_result.upsert.operation_details
+        operation_counts = {
+            row.operation: row["count"]
+            for row in operation_details.groupBy("operation").count().collect()
+        }
+        assert operation_counts == {"INSERT": 101, "UPDATE": 12, "DROP": 12}
         update_ids = operation_details.where(F.col("operation") == "UPDATE").select(
             "event_id"
         )
@@ -170,6 +175,7 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
             .where(F.col("event_date") != F.col("previous_event_date"))
         )
         assert moved_updates.count() == 12
+        day2_result.upsert.release()
 
         snapshot_count = spark.table(f"{table_id}.snapshots").count()
         replay = process_batch(str(day2), spark=spark)
