@@ -6,8 +6,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from clickpulse.common.validation import RawOccurrence, parse_occurrence, validate_event
 
@@ -263,6 +264,27 @@ def _spark_validation_schema():
     )
 
 
+def _normalize_spark_input_path(path: str) -> str:
+    """Return a Hadoop-readable URI without altering qualified input URIs."""
+    if not isinstance(path, str):
+        raise TypeError("input path must be a string")
+
+    windows_path = PureWindowsPath(path)
+    # PureWindowsPath considers a POSIX root ("/tmp/...") rooted, but it is
+    # not a Windows absolute path unless it has both a drive/share and a root.
+    if windows_path.drive and windows_path.root:
+        return windows_path.as_uri()
+    if path.startswith("/"):
+        return PurePosixPath(path).as_uri()
+
+    parsed = urlsplit(path)
+    if parsed.scheme:
+        # Preserve valid file:// and distributed filesystem URIs byte-for-byte.
+        return path
+
+    return Path(path).resolve().as_uri()
+
+
 def read_jsonl_occurrences(spark: Any, input_paths: str | Iterable[str]):
     """Read JSONL lines into a DataFrame with source path and 1-based line number.
 
@@ -277,12 +299,7 @@ def read_jsonl_occurrences(spark: Any, input_paths: str | Iterable[str]):
 
     occurrence_rdds = []
     for path in paths:
-        local_path = Path(path)
-        if local_path.is_file():
-            local_uri_path = local_path.resolve().as_posix()
-            spark_path = f"file:/{local_uri_path}"
-        else:
-            spark_path = path
+        spark_path = _normalize_spark_input_path(path)
 
         def with_location(indexed_line, source_path=path):
             raw_line, zero_based_line_number = indexed_line
