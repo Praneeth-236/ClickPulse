@@ -53,6 +53,7 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
     monkeypatch.setenv("SPARK_DRIVER_BIND_ADDRESS", "127.0.0.1")
 
     spark = create_iceberg_spark_session("clickpulse-iceberg-acceptance")
+    previous_dates = None
     try:
         assert spark.version == "3.3.4"
         table_id = f"{catalog}.{namespace}.{table}"
@@ -98,6 +99,11 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
         day1_state = spark.table(table_id).cache()
         assert day1_state.count() == 116
         assert day1_state.select("event_id").distinct().count() == 116
+        # Detach the Day 1 dates from the Iceberg table before Day 2 MERGE can
+        # invalidate caches or cause a later action to resolve the new snapshot.
+        previous_dates = day1_state.select(
+            "event_id", F.col("event_date").alias("previous_event_date")
+        ).localCheckpoint(eager=True)
 
         day2_result = process_batch(str(day2), spark=spark)
         assert day2_result.upsert is not None
@@ -173,15 +179,14 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
 
         # The acceptance dataset moves each updated row into a different UTC date.
         assert update_pairs.where(F.col("i.event_date") != F.col("t.event_date")).count() == 0
-        previous_dates = day1_state.select(
-            "event_id", F.col("event_date").alias("previous_event_date")
-        )
         moved_updates = (
             target.join(update_ids, "event_id")
             .join(previous_dates, "event_id")
             .where(F.col("event_date") != F.col("previous_event_date"))
         )
         assert moved_updates.count() == 12
+        previous_dates.unpersist()
+        previous_dates = None
         day2_result.upsert.release()
 
         snapshot_count = spark.table(f"{table_id}.snapshots").count()
@@ -213,4 +218,6 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
         assert day1_commit_after_unrelated[0].snapshot_id == str(day1_commit_snapshot.snapshot_id)
         day1_state.unpersist()
     finally:
+        if previous_dates is not None:
+            previous_dates.unpersist()
         spark.stop()
