@@ -6,9 +6,18 @@ This module deliberately provides no persistence or concurrency backend.
 import hashlib
 import re
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime, timezone
+from enum import Enum
 from typing import TypeVar
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 target runtime
+    class StrEnum(str, Enum):
+        """Small StrEnum compatibility shim for Python 3.10."""
+
+        def __str__(self) -> str:
+            return self.value
 
 
 class BatchStage(StrEnum):
@@ -341,7 +350,7 @@ def _normalize_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or offset is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     try:
-        return value.astimezone(UTC)
+        return value.astimezone(timezone.utc)
     except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} cannot be normalized to UTC") from exc
 

@@ -6,7 +6,7 @@ pydantic>=2.7,<3.0
 kafka-python>=2.0,<3.0
 
 # Spark
-pyspark>=3.5,<4.0
+pyspark==3.3.4
 
 # Dashboard and analytics
 streamlit>=1.36,<2.0

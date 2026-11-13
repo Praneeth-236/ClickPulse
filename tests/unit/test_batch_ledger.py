@@ -1,7 +1,7 @@
 """Tests for backend-independent batch identity and state domain behavior."""
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -23,6 +23,7 @@ from clickpulse.storage.batch_ledger import (
     validate_stage_transition,
 )
 
+UTC = timezone.utc
 NOW = datetime(2025, 1, 1, 12, tzinfo=UTC)
 OFFSET = timezone(timedelta(hours=5, minutes=30))
 
