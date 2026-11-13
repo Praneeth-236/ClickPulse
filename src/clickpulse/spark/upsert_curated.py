@@ -164,9 +164,10 @@ class SparkUpsertMetrics:
 class SparkUpsertResult:
     """Upsert output; callers must call ``release`` when done with operation details.
 
-    ``operation_details`` is persisted before the Iceberg MERGE so it remains a
-    stable audit of the pre-MERGE target state. Its cache is caller-owned and
-    must be released to avoid retaining data across repeated batches.
+    ``operation_details`` is eagerly locally checkpointed before the Iceberg
+    MERGE, truncating its dependency on the mutable target table. The checkpoint
+    uses Spark's cache subsystem, is caller-owned, and must be released to avoid
+    retaining data across repeated batches.
     """
 
     current_state: Any
@@ -176,7 +177,7 @@ class SparkUpsertResult:
     iceberg_committed_at: datetime | None
 
     def release(self, *, blocking: bool = False) -> None:
-        """Unpersist the pre-MERGE operation audit after its final use."""
+        """Release the pre-MERGE local checkpoint after its final use."""
         self.operation_details.unpersist(blocking=blocking)
 
 
@@ -605,8 +606,6 @@ def run_upsert(
         .when(F.col("s.event_time") > F.col("t.event_time"), F.lit("UPDATE"))
         .otherwise(F.lit("DROP"))
     )
-    from pyspark import StorageLevel
-
     details = comparison.select(
         F.col("s.event_id").alias("event_id"),
         operation.alias("operation"),
@@ -618,11 +617,11 @@ def run_upsert(
         )
         .otherwise(F.lit("incoming event_time is earlier"))
         .alias("reason"),
-    ).orderBy("event_id").persist(StorageLevel.MEMORY_AND_DISK)
+    ).orderBy("event_id").localCheckpoint(eager=True)
     try:
-        # Force the join against the pre-MERGE Iceberg snapshot now. Metrics and
-        # the returned audit both consume this same persisted classification.
-        details.count()
+        # Eager localCheckpoint materializes the pre-MERGE join and truncates
+        # its lineage, so later reads cannot resolve the Iceberg table again.
+        # Both metrics and the returned audit consume this checkpoint.
         return _execute_materialized_upsert(
             session,
             source,

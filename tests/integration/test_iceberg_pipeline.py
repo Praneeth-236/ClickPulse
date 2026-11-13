@@ -115,6 +115,11 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
             for row in operation_details.groupBy("operation").count().collect()
         }
         assert operation_counts == {"INSERT": 101, "UPDATE": 12, "DROP": 12}
+        assert operation_counts == {
+            "INSERT": day2_result.upsert.metrics.insert_count,
+            "UPDATE": day2_result.upsert.metrics.update_count,
+            "DROP": day2_result.upsert.metrics.drop_count,
+        }
         update_ids = operation_details.where(F.col("operation") == "UPDATE").select(
             "event_id"
         )
