@@ -14,10 +14,10 @@ DAY1_PATH = ROOT / "data/sample/clicks_day1.jsonl"
 DAY2_PATH = ROOT / "data/sample/clicks_day2.jsonl"
 
 
-def test_upsert_parser_projects_a_single_event_id_column(spark):
+def test_upsert_parser_projects_a_single_event_id_column(spark, tmp_path):
     from clickpulse.spark.upsert_curated import _parse_incoming_records
 
-    record = {
+    valid_record = {
         "event_id": "evt-unique-column",
         "user_id": "user-1",
         "session_id": "session-1",
@@ -27,16 +27,54 @@ def test_upsert_parser_projects_a_single_event_id_column(spark):
         "price": 2.5,
         "quantity": 1,
         "device": None,
-        "event_time": "2025-01-01T12:00:00Z",
-        "updated_at": "2025-01-01T12:01:00Z",
+        "event_time": "2025-01-01T00:15:00Z",
+        "updated_at": "2025-01-01T00:16:00Z",
     }
-    raw_line = json.dumps(record)
-    incoming = spark.createDataFrame([(raw_line, record["event_id"])], ["raw_line", "event_id"])
+    invalid_record = {key: value for key, value in valid_record.items() if key != "event_id"}
+    raw_lines = [json.dumps(valid_record), json.dumps(invalid_record)]
+    input_path = tmp_path / "parser-nullability.jsonl"
+    input_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+    validated_batch = run_validation_and_deduplication(str(input_path), spark=spark)
 
-    parsed = _parse_incoming_records(spark, incoming)
+    assert validated_batch.validation_metrics.valid_record_count == 1
+    assert validated_batch.validation_metrics.rejected_occurrence_count == 1
+    assert validated_batch.rejected_occurrences.first().rejection_reasons == [
+        "missing_or_empty_event_id"
+    ]
+
+    parsed = _parse_incoming_records(spark, validated_batch.winners)
 
     assert parsed.columns.count("event_id") == 1
-    assert parsed.select("event_id").first().event_id == record["event_id"]
+    assert parsed.select("event_id").first().event_id == valid_record["event_id"]
+    parsed_time = parsed.selectExpr(
+        "date_format(event_time, 'yyyy-MM-dd HH:mm:ss') AS event_time_utc",
+        "CAST(event_date AS STRING) AS event_date",
+    ).first()
+    assert parsed_time.event_time_utc == "2025-01-01 00:15:00"
+    assert parsed_time.event_date == "2025-01-01"
+    target_required_fields = {
+        "event_id",
+        "user_id",
+        "session_id",
+        "event_type",
+        "event_time",
+        "updated_at",
+        "event_date",
+    }
+    nullability = {field.name: field.nullable for field in parsed.schema.fields}
+    assert all(not nullability[field] for field in target_required_fields)
+
+    null_required_values = parsed.where(
+        " OR ".join(f"{field} IS NULL" for field in sorted(target_required_fields))
+    )
+    assert null_required_values.count() == 0
+
+    # A fabricated null winner ID cannot bypass the validation-to-upsert path.
+    null_id_winner = spark.createDataFrame(
+        [(json.dumps(valid_record), None)], "raw_line STRING, event_id STRING"
+    )
+    with pytest.raises(ValueError, match="does not match the event_id in raw_line"):
+        _parse_incoming_records(spark, null_id_winner)
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +84,7 @@ def spark():
         .appName("clickpulse-validation-deduplication-tests")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.executorEnv.PYTHONPATH", str(ROOT / "src"))
         .getOrCreate()
     )

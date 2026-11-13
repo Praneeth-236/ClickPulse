@@ -247,7 +247,7 @@ def _validate_iceberg_session(spark: Any, catalog: str) -> None:
 def _parse_incoming_records(spark: Any, incoming_records: Any):
     from pyspark.sql import functions as F
     from pyspark.sql.functions import udf
-    from pyspark.sql.types import BooleanType
+    from pyspark.sql.types import BooleanType, StructField, StructType
 
     required_columns = {"raw_line", "event_id"}
     missing = required_columns.difference(incoming_records.columns)
@@ -309,7 +309,8 @@ def _parse_incoming_records(spark: Any, incoming_records: Any):
         raise ValueError(
             "A validated winner could not be represented exactly by the canonical Spark schema"
         )
-    return event.select(
+
+    projected = event.select(
         "event_id",
         "user_id",
         "session_id",
@@ -322,6 +323,35 @@ def _parse_incoming_records(spark: Any, incoming_records: Any):
         "event_time",
         "updated_at",
         F.to_date("event_time").alias("event_date"),
+    )
+    required_fields = {
+        "event_id",
+        "user_id",
+        "session_id",
+        "event_type",
+        "event_time",
+        "updated_at",
+        "event_date",
+    }
+    target_source_schema = StructType(
+        [
+            StructField(
+                field.name,
+                field.dataType,
+                nullable=field.name not in required_fields,
+                metadata=field.metadata,
+            )
+            for field in projected.schema.fields
+        ]
+    )
+    # Spark filters do not refine nullable metadata. Re-encoding the distributed
+    # rows against this target-derived schema both advertises the required
+    # fields as NOT NULL to MERGE and verifies actual values on workers. This
+    # does not collect records on the driver or discard null-bearing rows.
+    return spark.createDataFrame(
+        projected.rdd,
+        schema=target_source_schema,
+        verifySchema=True,
     )
 
 
