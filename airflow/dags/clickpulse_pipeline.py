@@ -18,7 +18,7 @@ default_args = {
 
 REPO_DIR = "$HOME/ClickPulse"
 VENV_PY = f"{REPO_DIR}/.venv/bin/python3"
-ENV_PREFIX = f"cd {REPO_DIR} && PYTHONPATH={REPO_DIR}/src"
+ENV_PREFIX = f"export SPARK_HOME=/opt/spark && export PATH=/opt/spark/bin:$HOME/ClickPulse/.venv/bin:$PATH && cd {REPO_DIR} && PYTHONPATH={REPO_DIR}/src"
 
 with DAG(
     'clickpulse_pipeline',
