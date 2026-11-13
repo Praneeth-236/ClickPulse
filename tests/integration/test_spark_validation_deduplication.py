@@ -14,6 +14,31 @@ DAY1_PATH = ROOT / "data/sample/clicks_day1.jsonl"
 DAY2_PATH = ROOT / "data/sample/clicks_day2.jsonl"
 
 
+def test_upsert_parser_projects_a_single_event_id_column(spark):
+    from clickpulse.spark.upsert_curated import _parse_incoming_records
+
+    record = {
+        "event_id": "evt-unique-column",
+        "user_id": "user-1",
+        "session_id": "session-1",
+        "event_type": "page_view",
+        "product_id": None,
+        "category": None,
+        "price": 2.5,
+        "quantity": 1,
+        "device": None,
+        "event_time": "2025-01-01T12:00:00Z",
+        "updated_at": "2025-01-01T12:01:00Z",
+    }
+    raw_line = json.dumps(record)
+    incoming = spark.createDataFrame([(raw_line, record["event_id"])], ["raw_line", "event_id"])
+
+    parsed = _parse_incoming_records(spark, incoming)
+
+    assert parsed.columns.count("event_id") == 1
+    assert parsed.select("event_id").first().event_id == record["event_id"]
+
+
 @pytest.fixture(scope="module")
 def spark():
     session = (

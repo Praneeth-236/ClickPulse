@@ -255,16 +255,37 @@ def _parse_incoming_records(spark: Any, incoming_records: Any):
         raise ValueError(f"Incoming Spark DataFrame is missing columns: {sorted(missing)}")
     parsed = incoming_records.select(
         "raw_line",
-        "event_id",
+        F.col("event_id").alias("_winner_event_id"),
         F.from_json(
             "raw_line",
             _event_spark_schema(),
             {"mode": "FAILFAST", "timeZone": "UTC"},
         ).alias("_event"),
     )
-    event = parsed.select("raw_line", "event_id", F.col("_event.*"))
+    event = parsed.select(
+        "raw_line",
+        "_winner_event_id",
+        F.col("_event.event_id").alias("event_id"),
+        F.col("_event.user_id").alias("user_id"),
+        F.col("_event.session_id").alias("session_id"),
+        F.col("_event.event_type").alias("event_type"),
+        F.col("_event.product_id").alias("product_id"),
+        F.col("_event.category").alias("category"),
+        F.col("_event.price").alias("price"),
+        F.col("_event.quantity").alias("quantity"),
+        F.col("_event.device").alias("device"),
+        F.col("_event.event_time").alias("event_time"),
+        F.col("_event.updated_at").alias("updated_at"),
+    )
     decimal_fits_schema = udf(_price_fits_decimal_38_18, BooleanType())
     raw_price = F.get_json_object("raw_line", "$.price")
+    identity_mismatch = event.where(
+        F.col("_winner_event_id").isNull()
+        | (F.col("_winner_event_id") != F.col("event_id"))
+    )
+    if identity_mismatch.limit(1).count():
+        raise ValueError("Incoming winner event_id does not match the event_id in raw_line")
+
     invalid_conversion = event.where(
         F.col("event_id").isNull()
         | F.col("user_id").isNull()
