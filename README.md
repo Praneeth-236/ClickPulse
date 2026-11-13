@@ -5,7 +5,7 @@ ClickPulse is a distributed clickstream analytics pipeline. It ingests event rec
 ## Architecture
 
 - **VM1:** Event producer; Kafka brokers 1 and 2 using KRaft.
-- **VM2:** Kafka consumer/ingestion, HDFS NameNode and DataNode, Airflow.
+- **VM2:** Kafka consumer/ingestion, HDFS NameNode  and DataNode, Airflow.
 - **VM3:** Spark standalone master/worker and Spark jobs.
 - **VM4:** Apache Druid and Streamlit dashboard.
 
