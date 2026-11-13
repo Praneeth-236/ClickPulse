@@ -25,6 +25,7 @@ class SparkRuntimeConfig:
     ledger_table: str
     warehouse: str
     raw_path: str
+    export_path: str
     iceberg_runtime_jar: str | None
     driver_host: str | None
     driver_bind_address: str | None
@@ -51,6 +52,9 @@ def runtime_config() -> SparkRuntimeConfig:
         ledger_table=os.environ.get("ICEBERG_LEDGER_TABLE", "clickpulse_batch_ledger"),
         warehouse=warehouse,
         raw_path=raw_path,
+        export_path=os.environ.get(
+            "CLICKPULSE_EXPORT_PATH", f"{hdfs_uri}/clickpulse/exports/current-state"
+        ),
         iceberg_runtime_jar=os.environ.get("ICEBERG_RUNTIME_JAR"),
         driver_host=os.environ.get("SPARK_DRIVER_HOST"),
         driver_bind_address=os.environ.get("SPARK_DRIVER_BIND_ADDRESS"),
