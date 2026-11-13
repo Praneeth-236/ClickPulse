@@ -134,10 +134,47 @@ def _record_failure(ledger: IcebergBatchLedger, record: BatchRecord, error: Exce
         ledger.save(failure)
 
 
+def _configured_catalog_table_exists(spark: Any, table_identifier: str) -> bool:
+    """Check table existence through its configured Spark V2 catalog.
+
+    Spark 3.3's ``spark.catalog.tableExists`` does not accept catalog-qualified
+    identifiers. Calling the configured ``TableCatalog`` directly avoids
+    resolving this identifier against the session's default catalog. Catalog,
+    authorization, and connectivity errors are intentionally allowed to
+    propagate; only the catalog's normal ``False`` result means absent.
+    """
+    import re
+
+    parts = tuple(part.strip("`") for part in table_identifier.split("."))
+    if len(parts) != 3 or any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None for part in parts
+    ):
+        raise ValueError("table_identifier must be a catalog.namespace.table identifier")
+    catalog_name, namespace, table_name = parts
+
+    jvm = spark._jvm
+    namespace_array = jvm.java.lang.reflect.Array.newInstance(
+        jvm.java.lang.String, 1
+    )
+    jvm.java.lang.reflect.Array.set(namespace_array, 0, namespace)
+    identifier = jvm.org.apache.spark.sql.connector.catalog.Identifier.of(
+        namespace_array, table_name
+    )
+    catalog = (
+        spark._jsparkSession.sessionState()
+        .catalogManager()
+        .catalog(catalog_name)
+    )
+    return bool(catalog.tableExists(identifier))
+
+
 def _find_curated_commit(
     spark: Any, table_identifier: str, batch_id: str
 ) -> tuple[IcebergCommitReference, dict[str, int]] | None:
     from pyspark.sql import functions as F
+
+    if not _configured_catalog_table_exists(spark, table_identifier):
+        return None
 
     snapshots = spark.table(f"{table_identifier}.snapshots").where(
         F.col("summary").getItem("clickpulse.batch_id") == batch_id

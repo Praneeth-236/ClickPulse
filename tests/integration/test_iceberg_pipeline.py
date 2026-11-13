@@ -20,7 +20,10 @@ pytestmark = pytest.mark.skipif(
 def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypatch):
     from pyspark.sql import functions as F
 
-    from clickpulse.spark.pipeline import process_batch
+    from clickpulse.spark.pipeline import (
+        _configured_catalog_table_exists,
+        process_batch,
+    )
     from clickpulse.spark.runtime import create_iceberg_spark_session
     from clickpulse.spark.upsert_curated import _parse_incoming_records
 
@@ -52,6 +55,12 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
     try:
         assert spark.version == "3.3.4"
         table_id = f"{catalog}.{namespace}.{table}"
+        assert not _configured_catalog_table_exists(
+            spark, f"`{catalog}`.`{namespace}`.`{table}`"
+        )
+        assert not _configured_catalog_table_exists(
+            spark, f"`{catalog}`.`{namespace}`.`batch_ledger`"
+        )
 
         def fail_after_commit(_batch_id):
             raise RuntimeError("simulated process loss after Iceberg commit")
