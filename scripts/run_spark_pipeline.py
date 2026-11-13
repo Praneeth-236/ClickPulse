@@ -43,8 +43,7 @@ def main() -> int:
                     output["iceberg_snapshot_id"] = result.upsert.iceberg_snapshot_id
                 print(json.dumps(output, sort_keys=True))
             finally:
-                if result.upsert is not None:
-                    result.upsert.release()
+                result.release()
     finally:
         spark.stop()
     return 0

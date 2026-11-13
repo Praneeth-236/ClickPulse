@@ -1,9 +1,11 @@
 # Spark and Iceberg batch processing
 
-The Spark job reads JSONL paths directly from HDFS, validates and deduplicates
-with Spark DataFrames, merges winners into the configured Iceberg current-state
-table, and stores batch lifecycle records in an Iceberg ledger table. Configure
-the values in `.env` or export environment variables before running the script.
+The Spark job reads JSONL paths directly from HDFS, validates occurrences,
+persists rejected occurrences to the configured Iceberg rejected-events table,
+deduplicates valid records, merges winners into the configured Iceberg
+current-state table, and stores batch lifecycle records in an Iceberg ledger
+table. Configure the values in `.env` or export environment variables before
+running the script.
 
 ## VM3 execution
 
@@ -22,6 +24,7 @@ export ICEBERG_CATALOG='clickpulse_catalog'
 export ICEBERG_CATALOG_TYPE='hadoop'
 export ICEBERG_DATABASE='retailmart'
 export ICEBERG_TABLE='clickstream_events'
+export ICEBERG_REJECTED_TABLE='rejected_events'
 export ICEBERG_LEDGER_TABLE='clickpulse_batch_ledger'
 export ICEBERG_WAREHOUSE='hdfs://172.22.184.125:9000/clickpulse/warehouse'
 : "${ICEBERG_RUNTIME_JAR:?set this to the installed iceberg-spark-runtime-3.3_2.12-1.8.1.jar path}"
@@ -38,15 +41,33 @@ on other machines.
 
 ## Recovery boundaries
 
-The curated-table MERGE and batch-ledger MERGE are separate Iceberg commits.
-The curated snapshot records the source batch SHA-256 and operation counts. On
-restart, the pipeline looks for that marker before applying the same batch
-again, then advances the ledger from the observed snapshot. This is a recovery
-protocol, not a transaction spanning both tables. Recovery depends on snapshot
-metadata remaining available. The current Iceberg ledger has no distributed
-lease or unique-key constraint, so simultaneous workers processing the same
-new batch are not serialized. Do not describe this implementation as
-exactly-once processing.
+Rejected-event, curated-table, and batch-ledger writes are separate Iceberg
+commits. They do not form one atomic transaction. Rejected occurrences use a
+SHA-256 ID derived from the source batch ID, source path, and source line number;
+an insert-only MERGE makes sequential retries idempotent. The curated snapshot
+records the source batch SHA-256 and operation counts. On restart, the pipeline
+looks for that marker before applying the same batch again, then advances the
+ledger from the observed snapshot. Recovery depends on snapshot metadata
+remaining available. The current design has no distributed lease or unique-key
+constraint, so simultaneous workers processing the same batch are not
+serialized. Do not describe this implementation as exactly-once processing.
+
+## Backfill rejected occurrences
+
+Completed batches retain the normal replay fast path and will not be re-read by
+`run_spark_pipeline.py`. To backfill historical rejected occurrences without
+changing the curated table or ledger, run the dedicated idempotent script:
+
+```bash
+python scripts/backfill_rejected_events.py \
+  --input-path 'hdfs://172.22.184.125:9000/clickpulse/raw/clicks_day1.jsonl' \
+  --input-path 'hdfs://172.22.184.125:9000/clickpulse/raw/clicks_day2.jsonl'
+```
+
+The script computes the original-byte SHA-256 batch IDs, runs the existing
+distributed validator, and writes rejected occurrences only. Re-running it
+does not update existing rejected rows. The rejected table is configurable via
+`ICEBERG_REJECTED_TABLE` and defaults to `rejected_events`.
 
 The curated `price` representation is `DECIMAL(38,18)`. The Spark path rejects
 a validated value that cannot be represented exactly in that type instead of

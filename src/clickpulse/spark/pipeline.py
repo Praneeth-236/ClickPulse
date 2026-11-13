@@ -32,17 +32,32 @@ from clickpulse.storage.iceberg_batch_ledger import (
     IcebergBatchLedger,
     compute_source_sha256,
 )
+from clickpulse.storage.rejected_events import IcebergRejectedEventsStore
 
 
 @dataclass(frozen=True)
 class BatchPipelineResult:
-    """Pipeline outcome; release ``upsert`` after consuming its operation audit."""
+    """Pipeline outcome; call ``release`` after consuming returned DataFrames."""
 
     batch_id: str
     replayed: bool
     validation: SparkValidationResult | None
     deduplication: SparkDeduplicationResult | None
     upsert: SparkUpsertResult | None
+
+    def release(self) -> None:
+        """Release cached validation results and the upsert operation audit."""
+        if self.validation is not None:
+            self.validation.validated_records.unpersist()
+            self.validation.rejected_occurrences.unpersist()
+        if self.upsert is not None:
+            self.upsert.release()
+
+
+def _release_validation(validation: SparkValidationResult | None) -> None:
+    if validation is not None:
+        validation.validated_records.unpersist()
+        validation.rejected_occurrences.unpersist()
 
 
 def _now() -> datetime:
@@ -305,6 +320,15 @@ def process_batch(
     validation = None
     try:
         validation = validate_occurrences_dataframe(raw_occurrences)
+        rejected_store = IcebergRejectedEventsStore(
+            session,
+            config.catalog,
+            config.namespace,
+            config.rejected_table,
+        )
+        # Keep the VALIDATED stage active until every rejected occurrence is
+        # durably recorded. The rejected and curated tables are separate commits.
+        rejected_store.persist(validation.rejected_occurrences, batch_id)
         if _next_stage(record) is BatchStage.VALIDATED:
             record = _finish_stage(
                 ledger,
@@ -318,13 +342,14 @@ def process_batch(
                 ),
             )
     except Exception as exc:
+        _release_validation(validation)
         _record_failure(ledger, record, exc)
         raise
 
-    if _next_stage(record) is BatchStage.DEDUPLICATED:
-        record = _begin_stage(ledger, record, BatchStage.DEDUPLICATED)
     deduplication = None
     try:
+        if _next_stage(record) is BatchStage.DEDUPLICATED:
+            record = _begin_stage(ledger, record, BatchStage.DEDUPLICATED)
         deduplication = deduplicate_validated_dataframe(validation.validated_records)
         if _next_stage(record) is BatchStage.DEDUPLICATED:
             metrics = deduplication.metrics
@@ -342,14 +367,15 @@ def process_batch(
                 ),
             )
     except Exception as exc:
+        _release_validation(validation)
         _record_failure(ledger, record, exc)
         raise
 
-    if _next_stage(record) is BatchStage.CURATED_COMMITTED:
-        record = _begin_stage(ledger, record, BatchStage.CURATED_COMMITTED)
     upsert: SparkUpsertResult | None = None
     commit_returned = False
     try:
+        if _next_stage(record) is BatchStage.CURATED_COMMITTED:
+            record = _begin_stage(ledger, record, BatchStage.CURATED_COMMITTED)
         if _next_stage(record) is BatchStage.CURATED_COMMITTED:
             upsert = run_upsert(
                 deduplication.winners,
@@ -387,9 +413,16 @@ def process_batch(
         # recovery can reconcile it from the Iceberg snapshot marker.
         if upsert is not None:
             upsert.release()
+        _release_validation(validation)
         if not commit_returned:
             _record_failure(ledger, record, exc)
         raise
 
-    record = _complete_batch(ledger, record)
+    try:
+        record = _complete_batch(ledger, record)
+    except Exception:
+        if upsert is not None:
+            upsert.release()
+        _release_validation(validation)
+        raise
     return BatchPipelineResult(batch_id, False, validation, deduplication, upsert)

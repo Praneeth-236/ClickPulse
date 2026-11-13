@@ -7,6 +7,7 @@ from clickpulse.common.constants import (
     HDFS_RAW_PATH,
     ICEBERG_CURATED_TABLE,
     ICEBERG_DATABASE,
+    ICEBERG_REJECTED_TABLE,
 )
 
 ICEBERG_EXTENSIONS = "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
@@ -20,6 +21,7 @@ class SparkRuntimeConfig:
     catalog_type: str
     namespace: str
     table: str
+    rejected_table: str
     ledger_table: str
     warehouse: str
     raw_path: str
@@ -45,6 +47,7 @@ def runtime_config() -> SparkRuntimeConfig:
         catalog_type=os.environ.get("ICEBERG_CATALOG_TYPE", "hadoop"),
         namespace=os.environ.get("ICEBERG_DATABASE", ICEBERG_DATABASE),
         table=os.environ.get("ICEBERG_TABLE", ICEBERG_CURATED_TABLE),
+        rejected_table=os.environ.get("ICEBERG_REJECTED_TABLE", ICEBERG_REJECTED_TABLE),
         ledger_table=os.environ.get("ICEBERG_LEDGER_TABLE", "clickpulse_batch_ledger"),
         warehouse=warehouse,
         raw_path=raw_path,
