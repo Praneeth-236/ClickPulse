@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, TopicPartition
 
 from clickpulse.common.constants import HDFS_RAW_PATH, KAFKA_TOPIC
 from clickpulse.storage.batch_ledger import (
@@ -23,9 +23,10 @@ from clickpulse.storage.batch_ledger import (
     update_batch_stage,
 )
 
-DEFAULT_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "172.22.60.30:9092")
+DEFAULT_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "172.22.60.30:9092,172.22.60.30:9094")
 DEFAULT_GROUP_ID = os.getenv("KAFKA_CONSUMER_GROUP", "clickpulse-hdfs-raw-ingestor")
 HDFS_MANIFEST_DIR = "/clickpulse/metadata/manifests"
+HDFS_OFFSET_DIR = "/clickpulse/metadata/offsets"
 
 
 def _run_hdfs(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -52,15 +53,40 @@ def _decode_headers(headers: Sequence[tuple[str, bytes | None]] | None) -> dict[
     return decoded
 
 
+def _load_committed_offsets(offset_hdfs_path: str) -> dict[int, int]:
+    if not _hdfs_exists(offset_hdfs_path):
+        return {}
+    res = _run_hdfs(["-cat", offset_hdfs_path])
+    data = json.loads(res.stdout)
+    return {int(part): int(off) for part, off in data.get("offsets", {}).items()}
+
+
+def _save_committed_offsets(offset_hdfs_path: str, topic: str, group_id: str, offsets: dict[int, int]) -> None:
+    _run_hdfs(["-mkdir", "-p", HDFS_OFFSET_DIR])
+    payload = {
+        "topic": topic,
+        "group_id": group_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "offsets": {str(k): v for k, v in sorted(offsets.items())},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".json") as tmp_off:
+        json.dump(payload, tmp_off, indent=2)
+        local_off_path = Path(tmp_off.name)
+    try:
+        _run_hdfs(["-put", "-f", str(local_off_path), offset_hdfs_path])
+    finally:
+        local_off_path.unlink(missing_ok=True)
+
+
 def consume_to_hdfs(
     topic: str = KAFKA_TOPIC,
     target_hdfs_path: str = HDFS_RAW_PATH,
     batch_id: str | None = None,
     bootstrap_servers: str = DEFAULT_BOOTSTRAP_SERVERS,
     group_id: str = DEFAULT_GROUP_ID,
-    idle_timeout_ms: int = 5000,
+    idle_timeout_ms: int = 3000,
 ) -> int:
-    """Consume Kafka records and persist exact original bytes to HDFS."""
+    """Consume Kafka records via direct partition assignment and persist exact bytes to HDFS."""
     if batch_id and is_batch_completed(batch_id):
         print(f"[consumer] Batch '{batch_id}' already completed in ledger. Skipping.")
         return 0
@@ -72,13 +98,11 @@ def consume_to_hdfs(
             return 0
 
     servers = [s.strip() for s in bootstrap_servers.split(",") if s.strip()]
+    offset_hdfs_path = f"{HDFS_OFFSET_DIR}/{group_id}_{topic}.json"
     print(f"[consumer] Connecting to Kafka brokers={servers}, topic='{topic}', group='{group_id}'")
 
     consumer = KafkaConsumer(
-        topic,
         bootstrap_servers=servers,
-        group_id=group_id,
-        auto_offset_reset="earliest",
         enable_auto_commit=False,
         consumer_timeout_ms=idle_timeout_ms,
         value_deserializer=None,  # Keep raw bytes untouched
@@ -89,9 +113,32 @@ def consume_to_hdfs(
     record_count = 0
 
     try:
+        partition_ids = sorted(consumer.partitions_for_topic(topic) or [])
+        if not partition_ids:
+            print(f"[consumer] Topic '{topic}' has no available partitions.")
+            return 0
+
+        partitions = [TopicPartition(topic, p) for p in partition_ids]
+        consumer.assign(partitions)
+
+        committed = _load_committed_offsets(offset_hdfs_path)
+        beginning = consumer.beginning_offsets(partitions)
+        end = consumer.end_offsets(partitions)
+
+        has_unread = False
+        next_offsets: dict[int, int] = dict(committed)
+        for tp in partitions:
+            start_offset = max(committed.get(tp.partition, beginning[tp]), beginning[tp])
+            consumer.seek(tp, start_offset)
+            if start_offset < end[tp]:
+                has_unread = True
+
+        if not has_unread:
+            print(f"[consumer] No new messages available on topic '{topic}'.")
+            return 0
+
         for msg in consumer:
             raw_bytes: bytes = msg.value if msg.value is not None else b""
-            # Strip trailing newline if producer included one, then write exact line + single LF
             clean_line = raw_bytes.rstrip(b"\r\n")
             raw_buffer.extend(clean_line)
             raw_buffer.extend(b"\n")
@@ -107,6 +154,7 @@ def consume_to_hdfs(
                     "headers": headers,
                 }
             )
+            next_offsets[msg.partition] = msg.offset + 1
             record_count += 1
 
         if record_count == 0:
@@ -117,7 +165,6 @@ def consume_to_hdfs(
         content_hash = get_batch_id(raw_payload)
         resolved_batch_id = batch_id or content_hash
 
-        # Infer day subfolder from first message header if present (e.g., clicks_day1.jsonl -> day1)
         first_source = str(metadata_rows[0]["headers"].get("source_file", "")) if metadata_rows else ""
         sub_dir = ""
         if "day1" in first_source.lower():
@@ -133,7 +180,6 @@ def consume_to_hdfs(
 
         _run_hdfs(["-mkdir", "-p", dest_dir, HDFS_MANIFEST_DIR])
 
-        # Never overwrite an already-committed raw batch file
         if not _hdfs_exists(final_raw_hdfs):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as tmp_raw:
                 tmp_raw.write(raw_payload)
@@ -179,8 +225,8 @@ def consume_to_hdfs(
             },
         )
 
-        # Commit Kafka offsets ONLY after raw HDFS landing + manifest + ledger succeed
-        consumer.commit()
+        # Save committed offsets in HDFS ONLY after raw landing + manifest + ledger succeed
+        _save_committed_offsets(offset_hdfs_path, topic, group_id, next_offsets)
         print(
             f"[consumer] Committed {record_count} raw records to {final_raw_hdfs} "
             f"(batch_id={resolved_batch_id})."
@@ -204,7 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--idle-timeout-ms",
         type=int,
-        default=5000,
+        default=3000,
         help="Exit cleanly after N milliseconds with no new Kafka records.",
     )
     args = parser.parse_args(argv)
