@@ -163,11 +163,13 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
             .distinct()
         )
         assert rejected_ids.count() == 2
-        before_invalid = day1_state.join(rejected_ids, "event_id").collect()
-        after_invalid = target.join(rejected_ids, "event_id").collect()
-        assert {row.asDict() for row in before_invalid} == {
+        before_invalid = (
+            day1_state.join(rejected_ids, "event_id").orderBy("event_id").collect()
+        )
+        after_invalid = target.join(rejected_ids, "event_id").orderBy("event_id").collect()
+        assert [row.asDict() for row in before_invalid] == [
             row.asDict() for row in after_invalid
-        }
+        ]
 
         # The acceptance dataset moves each updated row into a different UTC date.
         assert update_pairs.where(F.col("i.event_date") != F.col("t.event_date")).count() == 0
