@@ -153,10 +153,10 @@ def _configured_catalog_table_exists(spark: Any, table_identifier: str) -> bool:
     catalog_name, namespace, table_name = parts
 
     jvm = spark._jvm
-    namespace_array = jvm.java.lang.reflect.Array.newInstance(
+    namespace_array = spark.sparkContext._gateway.new_array(
         jvm.java.lang.String, 1
     )
-    jvm.java.lang.reflect.Array.set(namespace_array, 0, namespace)
+    namespace_array[0] = namespace
     identifier = jvm.org.apache.spark.sql.connector.catalog.Identifier.of(
         namespace_array, table_name
     )

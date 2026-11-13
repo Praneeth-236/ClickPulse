@@ -12,7 +12,7 @@ from clickpulse.spark.pipeline import (
 
 def spark_with_catalog_table_exists(result=False):
     spark = MagicMock()
-    spark._jvm.java.lang.reflect.Array.newInstance.return_value = "namespace-array"
+    spark.sparkContext._gateway.new_array.return_value = [None]
     catalog = spark._jsparkSession.sessionState().catalogManager().catalog(
         "clickpulse_test_catalog"
     )
@@ -43,15 +43,14 @@ def test_table_existence_uses_configured_v2_catalog_identifier():
     )
 
     jvm = spark._jvm
-    jvm.java.lang.reflect.Array.newInstance.assert_called_once_with(
+    spark.sparkContext._gateway.new_array.assert_called_once_with(
         jvm.java.lang.String, 1
     )
-    jvm.java.lang.reflect.Array.set.assert_called_once_with(
-        "namespace-array", 0, "acceptance"
-    )
+    namespace_array = spark.sparkContext._gateway.new_array.return_value
+    assert namespace_array == ["acceptance"]
     identifier = jvm.org.apache.spark.sql.connector.catalog.Identifier.of.return_value
     jvm.org.apache.spark.sql.connector.catalog.Identifier.of.assert_called_once_with(
-        "namespace-array", "clickstream_events"
+        namespace_array, "clickstream_events"
     )
     catalog.tableExists.assert_called_once_with(identifier)
 
