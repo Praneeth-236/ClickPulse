@@ -22,6 +22,7 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
 
     from clickpulse.spark.pipeline import (
         _configured_catalog_table_exists,
+        _find_curated_commit,
         process_batch,
     )
     from clickpulse.spark.runtime import create_iceberg_spark_session
@@ -62,11 +63,33 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
             spark, f"`{catalog}`.`{namespace}`.`batch_ledger`"
         )
 
+        day1_batch_ids = []
+
         def fail_after_commit(_batch_id):
+            day1_batch_ids.append(_batch_id)
             raise RuntimeError("simulated process loss after Iceberg commit")
 
         with pytest.raises(RuntimeError, match="simulated process loss"):
             process_batch(str(day1), spark=spark, after_curated_commit=fail_after_commit)
+
+        assert len(day1_batch_ids) == 1
+        day1_batch_id = day1_batch_ids[0]
+        day1_commit_snapshot = (
+            spark.table(f"{table_id}.snapshots")
+            .where(F.col("summary").getItem("clickpulse.batch_id") == day1_batch_id)
+            .orderBy(F.col("committed_at").desc())
+            .first()
+        )
+        assert day1_commit_snapshot is not None
+        assert day1_commit_snapshot.summary["clickpulse.batch_id"] == day1_batch_id
+        assert day1_commit_snapshot.summary["clickpulse.insert_count"] == "116"
+        assert day1_commit_snapshot.summary["clickpulse.update_count"] == "0"
+        assert day1_commit_snapshot.summary["clickpulse.drop_count"] == "0"
+        assert day1_commit_snapshot.operation
+        recovered_marker = _find_curated_commit(spark, table_id, day1_batch_id)
+        assert recovered_marker is not None
+        assert recovered_marker[0].snapshot_id == str(day1_commit_snapshot.snapshot_id)
+        assert recovered_marker[1] == {"insert_count": 116, "update_count": 0, "drop_count": 0}
 
         # The durable ledger still says CURATED_COMMITTED is in progress. The
         # batch marker in the curated snapshot lets the next process recover it.
@@ -154,6 +177,27 @@ def test_day1_day2_iceberg_upsert_replay_and_commit_recovery(tmp_path, monkeypat
         assert spark.table(f"{table_id}.snapshots").count() == snapshot_count
         assert spark.table(table_id).count() == 217
         assert spark.table(table_id).groupBy("event_id").count().where("count > 1").count() == 0
+
+        # A later commit marked with a different batch identity must not be
+        # mistaken for the recovered Day 1 commit.
+        (
+            target.limit(1)
+            .withColumn("event_id", F.concat(F.lit("marker-probe-"), F.col("event_id")))
+            .writeTo(table_id)
+            .option("snapshot-property.clickpulse.batch_id", "unrelated-batch")
+            .append()
+        )
+        unrelated_snapshot = (
+            spark.table(f"{table_id}.snapshots")
+            .where(F.col("summary").getItem("clickpulse.batch_id") == "unrelated-batch")
+            .orderBy(F.col("committed_at").desc())
+            .first()
+        )
+        assert unrelated_snapshot is not None
+        assert str(unrelated_snapshot.snapshot_id) != str(day1_commit_snapshot.snapshot_id)
+        day1_commit_after_unrelated = _find_curated_commit(spark, table_id, day1_batch_id)
+        assert day1_commit_after_unrelated is not None
+        assert day1_commit_after_unrelated[0].snapshot_id == str(day1_commit_snapshot.snapshot_id)
         day1_state.unpersist()
     finally:
         spark.stop()

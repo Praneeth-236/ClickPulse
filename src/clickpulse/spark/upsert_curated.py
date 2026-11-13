@@ -369,6 +369,51 @@ def _price_fits_decimal_38_18(raw_value: str | None) -> bool:
         return False
 
 
+def _execute_sql_with_snapshot_properties(
+    spark: Any, statement: str, properties: Mapping[str, str]
+) -> None:
+    """Run a SQL write inside Iceberg's JVM-side commit metadata scope.
+
+    Iceberg 1.8.1 exposes custom metadata for SQL writes through
+    ``CommitMetadata.withCommitProperties``. Its properties are thread-local,
+    so a Python ``Callable`` proxy would run the SQL on a different JVM thread.
+    Java 11's built-in Nashorn engine provides a JVM-local ``Callable`` adapter
+    and keeps the MERGE on the thread where Iceberg installs those properties.
+    """
+    jvm = spark._jvm
+    engine = jvm.javax.script.ScriptEngineManager().getEngineByName("nashorn")
+    if engine is None:
+        raise RuntimeError(
+            "Iceberg SQL snapshot markers require the Java 11 Nashorn scripting engine"
+        )
+
+    java_properties = jvm.java.util.HashMap()
+    for key, value in properties.items():
+        java_properties.put(key, value)
+
+    engine.put("clickpulseSpark", spark._jsparkSession)
+    engine.put("clickpulseStatement", statement)
+    engine.put("clickpulseProperties", java_properties)
+    engine.eval(
+        "var Callable = Java.type('java.util.concurrent.Callable');\n"
+        "var CommitMetadata = Java.type('org.apache.iceberg.spark.CommitMetadata');\n"
+        "var RuntimeException = Java.type('java.lang.RuntimeException');\n"
+        "var merge = new Callable({ call: function() {\n"
+        "  clickpulseSpark.sql(clickpulseStatement);\n"
+        "  return null;\n"
+        "} });\n"
+        "CommitMetadata.withCommitProperties("
+        "clickpulseProperties, merge, RuntimeException.class);"
+    )
+
+
+def _require_batch_snapshot_marker(summary: Mapping[str, str], batch_id: str) -> None:
+    if summary.get("clickpulse.batch_id") != batch_id:
+        raise RuntimeError(
+            "Iceberg committed a new snapshot without the expected ClickPulse batch marker"
+        )
+
+
 def run_upsert(
     incoming_records: Any,
     *,
@@ -490,36 +535,23 @@ def run_upsert(
     )
     previous_snapshot_id = str(previous_snapshot.snapshot_id) if previous_snapshot else None
     marker_values = {
-        "batch_id": batch_id,
-        "insert_count": str(metrics.insert_count),
-        "update_count": str(metrics.update_count),
-        "drop_count": str(metrics.drop_count),
+        "clickpulse.batch_id": batch_id,
+        "clickpulse.insert_count": str(metrics.insert_count),
+        "clickpulse.update_count": str(metrics.update_count),
+        "clickpulse.drop_count": str(metrics.drop_count),
     }
-    marker_keys = {
-        key: f"spark.sql.iceberg.snapshot-property.clickpulse.{key}"
-        for key in marker_values
-    }
-    prior_markers = {
-        key: session.conf.get(config_key, None)
-        for key, config_key in marker_keys.items()
-    }
-    if batch_id is not None:
-        for key, config_key in marker_keys.items():
-            session.conf.set(config_key, marker_values[key])
+    merge_statement = (
+        f"MERGE INTO {table_id} AS t USING {source_view} AS s "
+        "ON t.event_id = s.event_id "
+        f"WHEN MATCHED AND s.event_time > t.event_time THEN UPDATE SET {assignments} "
+        f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})"
+    )
     try:
-        session.sql(
-            f"MERGE INTO {table_id} AS t USING {source_view} AS s "
-            "ON t.event_id = s.event_id "
-            f"WHEN MATCHED AND s.event_time > t.event_time THEN UPDATE SET {assignments} "
-            f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})"
-        )
+        if batch_id is None:
+            session.sql(merge_statement)
+        else:
+            _execute_sql_with_snapshot_properties(session, merge_statement, marker_values)
     finally:
-        if batch_id is not None:
-            for key, config_key in marker_keys.items():
-                if prior_markers[key] is None:
-                    session.conf.unset(config_key)
-                else:
-                    session.conf.set(config_key, prior_markers[key])
         session.catalog.dropTempView(source_view)
 
     current_state = session.table(table_id)
@@ -535,20 +567,25 @@ def run_upsert(
 
     snapshot_id = None
     committed_at = None
-    latest_snapshot = session.sql(
-        f"SELECT snapshot_id, summary, committed_at FROM {table_id}.snapshots "
-        "ORDER BY committed_at DESC LIMIT 1"
-    ).first()
-    if latest_snapshot and str(latest_snapshot.snapshot_id) != previous_snapshot_id:
+    snapshots = session.table(f"{table_id}.snapshots")
+    latest_snapshot = snapshots.orderBy(F.col("committed_at").desc()).first()
+    batch_snapshot = None
+    if batch_id is not None:
+        batch_snapshot = (
+            snapshots.where(
+                F.col("summary").getItem("clickpulse.batch_id") == batch_id
+            )
+            .orderBy(F.col("committed_at").desc())
+            .first()
+        )
+    if batch_snapshot is not None:
+        snapshot_id = str(batch_snapshot.snapshot_id)
+        committed_at = batch_snapshot.committed_at.replace(tzinfo=timezone.utc)
+    elif latest_snapshot and str(latest_snapshot.snapshot_id) != previous_snapshot_id:
+        if batch_id is not None:
+            _require_batch_snapshot_marker(latest_snapshot.summary, batch_id)
         snapshot_id = str(latest_snapshot.snapshot_id)
         committed_at = latest_snapshot.committed_at.replace(tzinfo=timezone.utc)
-        if (
-            batch_id is not None
-            and latest_snapshot.summary.get("clickpulse.batch_id") != batch_id
-        ):
-            raise RuntimeError(
-                "Iceberg committed a new snapshot without the expected ClickPulse batch marker"
-            )
     return SparkUpsertResult(
         current_state=current_state,
         operation_details=details.orderBy("event_id"),
