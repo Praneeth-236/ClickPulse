@@ -1,11 +1,11 @@
 ﻿# ClickPulse — Build Your Own Analytics System
 
-ClickPulse is a distributed clickstream analytics pipeline. It ingests event records through Kafka, preserves original input in HDFS, validates and upserts current event state using Spark and Apache Iceberg, exports the current curated state for Apache Druid, and presents analytics in a Streamlit dashboard. Apache Airflow orchestrates processing.
+ClickPulse is a distributed clickstream analytics pipeline. It ingests event records through Kafka, preserves original input in HDFS, validates and upserts current event state using Spark and Apache Iceberg, exports the current curated state for Apache Druid, and presents analytics in a Streamlit dashboard. Apache Airflow orchestrates  processing.
 
 ## Architecture
 
 - **VM1:** Event producer; Kafka brokers 1 and 2 using KRaft.
-- **VM2:** Kafka consumer/ingestion, HDFS NameNode and DataNode, Airflow.
+- **VM2:** Kafka consumer/ingestion, HDFS NameNode  and DataNode, Airflow.
 - **VM3:** Spark standalone master/worker and Spark jobs.
 - **VM4:** Apache Druid and Streamlit dashboard.
 
